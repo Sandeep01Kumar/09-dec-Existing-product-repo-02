@@ -108,7 +108,7 @@ On Windows, `npm test` reports `Test Results: 8 passed, 2 failed` and exits with
 
 ## API Documentation
 
-The server exposes a **single catch-all request handler** — there is no router, and the same handler observes every path (`Source: server.js:L252-L314`). The complete observable HTTP contract is summarized below. Every row was verified live against the running server; the `GET`, `HEAD`, `OPTIONS`, and `405` rows are additionally asserted by the automated test harness, while the `400` and `503` rows are verified manually (the harness does not assert them).
+The server exposes a **single catch-all request handler** — there is no router, and the same handler observes every path (`Source: server.js:L252-L314`). The complete observable HTTP contract is summarized below. The `GET`, `HEAD`, `OPTIONS`, and `405` rows were verified live against the running server and are additionally asserted by the automated test harness; the `400` (over-length URL) row was likewise verified live with a manual `curl` probe. The `503` (shutdown) row is **race-dependent and is not externally reproducible with a fresh `curl`** (see the notes below); its response is verified by code inspection and by direct handler invocation rather than a live external probe.
 
 | Condition | Method / Path | Response | Key Headers | Source |
 |-----------|---------------|----------|-------------|--------|
@@ -128,7 +128,7 @@ The server exposes a **single catch-all request handler** — there is no router
 
 ### Worked Examples
 
-The responses below are live-verified. Ancillary headers emitted by Node (for example `Date` and `Connection`) are elided for clarity.
+The `GET`, `HEAD`, `OPTIONS`, `405`, and `400` responses below were captured live from the running server; the `503` (shutdown) response is **not externally reproducible with a fresh `curl`** (see the note in that example) and is shown exactly as the handler emits it, verified by code inspection and by direct handler invocation. Ancillary headers emitted by Node (for example `Date` and `Connection`) are elided for clarity.
 
 **`GET /` → `200 OK`** (`Source: server.js:L310-L313`)
 
@@ -319,7 +319,7 @@ The suite contains **10 tests**. On POSIX platforms (Linux, macOS) all ten pass 
 - Multi-path routing — `/`, `/test`, `/api`, and `/any/path` all behave identically.
 - Graceful shutdown — both `SIGTERM` and `SIGINT` shut the server down cleanly with exit code `0` (**these two tests pass on POSIX platforms but fail on Windows**, as noted above).
 
-The harness does **not** assert the `400` (URL-validation) or `503` (shutdown) branches of the contract; those behaviors are verified manually with live `curl` probes rather than by the automated suite.
+The harness does **not** assert the `400` (URL-validation) or `503` (shutdown) branches of the contract. The `400` behavior is verified manually with a live `curl` probe; the `503` (shutdown) branch is **race-dependent and not externally reproducible with a fresh `curl`** (see [API Documentation](#api-documentation)), so it is verified by code inspection and by direct handler invocation rather than a live probe.
 
 ## Project Structure
 
