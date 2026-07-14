@@ -5,11 +5,6 @@
  * plus process-level safety nets. Binds to 127.0.0.1:3000 and responds to every
  * path through a single catch-all request handler.
  *
- * Robust HTTP Server Implementation
- * 
- * This server includes comprehensive error handling, graceful shutdown,
- * input validation, and proper resource cleanup.
- * 
  * Features:
  * - Server-level error handling (EADDRINUSE, EACCES)
  * - Request/response error handling
@@ -61,11 +56,13 @@ const SHUTDOWN_TIMEOUT = 5000; // 5 seconds timeout for graceful shutdown
  */
 const ALLOWED_METHODS = ['GET', 'HEAD', 'OPTIONS'];
 
-// Maximum URL length (common browser limit)
+// Maximum URL length (conservative application-configured cap)
 /**
  * Maximum permitted length, in characters, of a request URL. Requests whose URL
- * exceeds this limit are rejected with 400 Bad Request. The value mirrors the de
- * facto browser/proxy URL-length limit of 2048 characters.
+ * exceeds this limit are rejected with 400 Bad Request by {@link validateUrl}.
+ * 2048 is this server's configured, conservative cap on request-URL size; it is
+ * an application setting chosen by this project, not an inherent HTTP, browser,
+ * or proxy limit.
  * @constant {number}
  * @default 2048
  */
@@ -86,12 +83,32 @@ let isShuttingDown = false;
 let shutdownTimer = null;
 
 /**
- * Graceful shutdown handler
- * Closes the server and waits for existing connections to complete
- * Forces exit after SHUTDOWN_TIMEOUT if connections don't close
- * 
- * @param {string} signal - The signal that triggered the shutdown (SIGTERM/SIGINT)
- * @returns {void}
+ * Initiates a one-time graceful shutdown of the HTTP server and then terminates
+ * the process. This is the single shutdown routine shared by every trigger; it is
+ * idempotent, so any repeated or concurrent trigger after the first is logged and
+ * ignored.
+ *
+ * Sequence:
+ * 1. If a shutdown is already in progress ({@link isShuttingDown} is `true`), log
+ *    that the trigger is being ignored and return immediately (idempotent early
+ *    return).
+ * 2. Set {@link isShuttingDown} to `true` (so the request handler begins replying
+ *    503 to new requests) and log that graceful shutdown has started.
+ * 3. Arm a forced-exit timer for {@link SHUTDOWN_TIMEOUT} ms (5 seconds) and
+ *    `unref()` it so the timer never keeps the event loop alive on its own. If the
+ *    timer fires first, log the timeout and call `process.exit(1)`.
+ * 4. Call `server.close(callback)` to stop accepting new connections and wait for
+ *    in-flight ones to drain. In the callback: on error, log it, clear the timer,
+ *    and `process.exit(1)`; on a clean drain, log completion, clear the timer, and
+ *    `process.exit(0)`.
+ *
+ * @param {string} signal - Label identifying what triggered the shutdown; used
+ *   only for logging. Current callers pass the OS signal names `'SIGTERM'` and
+ *   `'SIGINT'`, plus the process-level trigger labels `'uncaughtException'` and
+ *   `'unhandledRejection'`.
+ * @returns {void} Returns synchronously; the process exit happens asynchronously
+ *   from the `server.close` callback (exit 0 on clean drain, exit 1 on close
+ *   error) or from the forced-exit timer (exit 1 on timeout).
  */
 function gracefulShutdown(signal) {
   // Prevent multiple shutdown attempts
@@ -183,31 +200,42 @@ function sendErrorResponse(res, statusCode, message, additionalHeaders = {}) {
  * HTTP request handler for every incoming request. This is the server's single
  * catch-all handler; there is no router, so all URL paths are treated identically.
  *
+ * All error responses below (400, 405, 503) are produced by {@link sendErrorResponse},
+ * which sets `Content-Type: text/plain` and writes the supplied message followed by
+ * a trailing newline (`\n`) as the body.
+ *
  * Request-decision cascade, evaluated in order:
  * 1. Attach `error` listeners to the request and response streams so a client
- *    disconnect or broken pipe is logged and, where possible, answered with
- *    400 Bad Request instead of crashing the process.
+ *    disconnect or broken pipe is logged. A request-stream error is answered,
+ *    only if response headers have not already been sent, with 400 and the body
+ *    `Bad Request\n`, instead of crashing the process.
  * 2. If a graceful shutdown is in progress ({@link isShuttingDown} is `true`),
- *    respond 503 Service Unavailable with `Retry-After: 30` and `Connection: close`.
- * 3. Validate the URL via {@link validateUrl}; on failure respond 400 Bad Request.
- * 4. If the method is not in {@link ALLOWED_METHODS}, respond 405 Method Not
- *    Allowed with an `Allow` header listing the permitted methods.
- * 5. `OPTIONS` -> 204 No Content with an `Allow` header and `Content-Length: 0`.
- * 6. `HEAD` -> 200 OK with `Content-Type: text/plain` and a `Content-Length`
+ *    respond 503 Service Unavailable with headers `Retry-After: 30` and
+ *    `Connection: close` and the body `Service Unavailable - Server is shutting down\n`.
+ * 3. Validate the URL via {@link validateUrl}; on failure respond 400 with the body
+ *    `Bad Request - <reason>\n`, where `<reason>` is the validation error message
+ *    (e.g. `URL exceeds maximum length of 2048 characters` or
+ *    `URL contains invalid null bytes`).
+ * 4. If the method is not in {@link ALLOWED_METHODS}, respond 405 with an `Allow`
+ *    header listing the permitted methods and the body `Method Not Allowed\n`.
+ * 5. `OPTIONS` -> 204 No Content with an `Allow` header and `Content-Length: 0`;
+ *    no response body.
+ * 6. `HEAD` -> 200 OK with `Content-Type: text/plain` and a `Content-Length: 14`
  *    header, but no response body.
- * 7. `GET` -> 200 OK with `Content-Type: text/plain` and the body `Hello, World!\n`.
+ * 7. `GET` -> 200 OK with `Content-Type: text/plain`, `Content-Length: 14`, and the
+ *    body `Hello, World!\n`.
  *
  * @param {http.IncomingMessage} req - The incoming HTTP request.
  * @param {http.ServerResponse} res - The outgoing HTTP response.
  * @returns {void}
  * @example
- * // Verified live (also asserted by server.test.js tests 1 & 8):
+ * // Live curl probe of GET / (every header/body field below was observed live):
  * // $ curl -i http://127.0.0.1:3000/
  * // HTTP/1.1 200 OK
- * // Content-Type: text/plain
- * // Content-Length: 14
+ * // Content-Type: text/plain     // this field is asserted by test 7 (Content-Type validation)
+ * // Content-Length: 14           // observed live only; not asserted by any test
  * //
- * // Hello, World!
+ * // Hello, World!                // the 200 status and this body are asserted by tests 1 & 8
  */
 const server = http.createServer((req, res) => {
   // Handle request errors (e.g., client disconnection during upload)
@@ -288,7 +316,6 @@ const server = http.createServer((req, res) => {
  * @param {NodeJS.ErrnoException} err - The error emitted by the server; its `code`
  *   property (e.g. `'EADDRINUSE'`, `'EACCES'`) drives the diagnosis.
  * @returns {void}
- * @listens http.Server#error
  */
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
@@ -310,11 +337,10 @@ server.on('error', (err) => {
 
 /**
  * Starts the server and registers the "ready" callback. The callback runs once
- * the server is listening on `hostname:port`; it logs the listen URL and a hint
- * that Ctrl+C triggers a graceful shutdown.
+ * the server emits the `net.Server` `'listening'` event (bound on `hostname:port`);
+ * it logs the listen URL and a hint that Ctrl+C triggers a graceful shutdown.
  *
  * @returns {void}
- * @listens net.Server#listening
  */
 server.listen(port, hostname, () => {
   console.log(`Server running at http://${hostname}:${port}/`);
@@ -328,7 +354,6 @@ server.listen(port, hostname, () => {
  * stop. This handler delegates to {@link gracefulShutdown} with the signal name.
  *
  * @returns {void}
- * @listens process#SIGTERM
  */
 process.on('SIGTERM', () => {
   gracefulShutdown('SIGTERM');
@@ -339,7 +364,6 @@ process.on('SIGTERM', () => {
  * an interactive terminal. Delegates to {@link gracefulShutdown}.
  *
  * @returns {void}
- * @listens process#SIGINT
  */
 process.on('SIGINT', () => {
   gracefulShutdown('SIGINT');
@@ -353,7 +377,6 @@ process.on('SIGINT', () => {
  *
  * @param {Error} err - The uncaught error.
  * @returns {void}
- * @listens process#uncaughtException
  */
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err.message);
@@ -376,7 +399,6 @@ process.on('uncaughtException', (err) => {
  * @param {*} reason - The rejection reason (any value passed to `reject`/thrown).
  * @param {Promise} promise - The promise that was rejected without a handler.
  * @returns {void}
- * @listens process#unhandledRejection
  */
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise);
@@ -391,12 +413,22 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 /**
- * Public module exports, provided primarily for testing and programmatic control.
+ * Public module exports, provided primarily for programmatic inspection and
+ * control. Note that requiring this module has a side effect: `server.listen(...)`
+ * runs at load time, so by the time these exports are accessible the server is
+ * already listening on `hostname:port` (`server.listening === true`). Calling
+ * `server.listen()` on it again would throw `ERR_SERVER_ALREADY_LISTEN`. (The
+ * bundled `server.test.js` does not import these exports; it spawns `node
+ * server.js` as a child process instead.)
  *
- * @property {http.Server} server - The configured HTTP server instance, so tests
- *   and embedding code can start, query, or close it directly.
+ * @property {http.Server} server - The already-started HTTP server instance,
+ *   exposed so callers can inspect it (e.g. `server.listening`, `server.address()`),
+ *   send requests to it, or close it via `server.close()`. It does not need to be
+ *   started; it is listening as soon as this module has finished loading.
  * @property {function(string): void} gracefulShutdown - The shutdown trigger; call
- *   with a signal name (e.g. `'SIGTERM'`) to begin an orderly shutdown.
+ *   with a trigger label (e.g. `'SIGTERM'`) to begin an orderly shutdown. WARNING:
+ *   this terminates the host process; it calls `process.exit(0)` on a clean drain
+ *   or `process.exit(1)` on a close error or shutdown timeout.
  */
 // Export server for testing purposes
 module.exports = { server, gracefulShutdown };
