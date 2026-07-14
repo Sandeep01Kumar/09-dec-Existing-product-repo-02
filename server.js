@@ -156,10 +156,20 @@ function gracefulShutdown(signal) {
 }
 
 /**
+ * Result object returned by {@link validateUrl}, describing whether a request
+ * URL is acceptable and, when it is not, why it was rejected.
+ *
+ * @typedef {Object} UrlValidationResult
+ * @property {boolean} valid - `true` when the URL passes all checks; `false` otherwise.
+ * @property {string} [error] - Human-readable reason for rejection. Present only
+ *   when `valid` is `false`; absent when `valid` is `true`.
+ */
+
+/**
  * Validates the request URL
  * 
  * @param {string} url - The URL to validate (typically `req.url`).
- * @returns {{valid: boolean, error?: string}} Result object: `valid` is `true`
+ * @returns {UrlValidationResult} Result object: `valid` is `true`
  *   when the URL passes all checks; otherwise `valid` is `false` and `error`
  *   holds a human-readable reason.
  * @example
