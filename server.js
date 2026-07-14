@@ -53,6 +53,15 @@ const SHUTDOWN_TIMEOUT = 5000; // 5 seconds timeout for graceful shutdown
  * these methods — but only after the earlier stages of the request-decision cascade
  * pass. The shutdown check (503) and URL validation (400) run first, so, for
  * example, a `POST` carrying an over-length URL is answered with 400, not 405.
+ *
+ * Scope of the 405 contract: this list — and the 405 rejection built from it — apply
+ * only to methods that are actually delivered to the request handler. Some request
+ * methods are dispatched by Node.js to dedicated `http.Server` events instead of the
+ * request callback and therefore never reach this check: `CONNECT` is routed to the
+ * `'connect'` event and any `Upgrade` request to the `'upgrade'` event. This server
+ * registers no `'connect'` or `'upgrade'` listener, so such requests are not matched
+ * against this list and are not answered with 405 (the underlying socket is simply
+ * closed with no application response). See {@link RequestListener}.
  * @constant {string[]}
  * @default ['GET', 'HEAD', 'OPTIONS']
  */
@@ -219,6 +228,21 @@ function sendErrorResponse(res, statusCode, message, additionalHeaders = {}) {
 }
 
 /**
+ * The request listener passed to `http.createServer` and installed as the server's
+ * sole `'request'` handler; it implements the full request-decision cascade
+ * documented on the exported {@link server} constant. Every URL path is handled
+ * identically (there is no router). Request methods that Node.js routes to dedicated
+ * server events — `CONNECT` (the `'connect'` event) and `Upgrade` (the `'upgrade'`
+ * event) — never reach this listener and are therefore not subject to the 405 method
+ * contract (see {@link ALLOWED_METHODS}).
+ *
+ * @callback RequestListener
+ * @param {http.IncomingMessage} req - The incoming HTTP request.
+ * @param {http.ServerResponse} res - The outgoing HTTP response.
+ * @returns {void}
+ */
+
+/**
  * HTTP request handler for every incoming request. This is the server's single
  * catch-all handler; there is no router, so all URL paths are treated identically.
  *
@@ -233,19 +257,33 @@ function sendErrorResponse(res, statusCode, message, additionalHeaders = {}) {
  *    `Bad Request\n`, instead of crashing the process.
  * 2. If a graceful shutdown is in progress ({@link isShuttingDown} is `true`),
  *    respond 503 Service Unavailable with headers `Retry-After: 30` and
- *    `Connection: close` and the body `Service Unavailable - Server is shutting down\n`.
+ *    `Connection: close` and the body `Service Unavailable - Server is shutting down\n`
+ *    (the body applies to non-HEAD requests; see the "HEAD and response bodies" note
+ *    below).
  * 3. Validate the URL via {@link validateUrl}; on failure respond 400 with the body
  *    `Bad Request - <reason>\n`, where `<reason>` is the validation error message
  *    (e.g. `URL exceeds maximum length of 2048 characters` or
- *    `URL contains invalid null bytes`).
+ *    `URL contains invalid null bytes`). The body applies to non-HEAD requests; see
+ *    the "HEAD and response bodies" note below.
  * 4. If the method is not in {@link ALLOWED_METHODS}, respond 405 with an `Allow`
- *    header listing the permitted methods and the body `Method Not Allowed\n`.
+ *    header listing the permitted methods and the body `Method Not Allowed\n`. This
+ *    405 rule covers only methods that are delivered to this handler; `CONNECT` and
+ *    `Upgrade` requests are dispatched by Node.js to the server `'connect'`/`'upgrade'`
+ *    events (not this callback) and, with no such listener registered, never reach
+ *    step 4 — so they are not answered with 405. See {@link ALLOWED_METHODS}.
  * 5. `OPTIONS` -> 204 No Content with an `Allow` header and `Content-Length: 0`;
  *    no response body.
  * 6. `HEAD` -> 200 OK with `Content-Type: text/plain` and a `Content-Length: 14`
  *    header, but no response body.
  * 7. `GET` -> 200 OK with `Content-Type: text/plain`, `Content-Length: 14`, and the
  *    body `Hello, World!\n`.
+ *
+ * HEAD and response bodies: for a `HEAD` request Node.js suppresses the response body
+ * and does not emit an automatic `Content-Length`. A `HEAD` request answered by one of
+ * the error branches above (for example an over-length URL producing 400, or a request
+ * arriving during shutdown producing 503) therefore returns the status line and headers
+ * only, with no body — even though the descriptions above show the body that a non-HEAD
+ * (e.g. `GET`) request would receive.
  *
  * @param {http.IncomingMessage} req - The incoming HTTP request.
  * @param {http.ServerResponse} res - The outgoing HTTP response.
@@ -299,7 +337,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Handle OPTIONS request (CORS preflight, method discovery)
+  // Handle OPTIONS request (method discovery)
   if (req.method === 'OPTIONS') {
     res.statusCode = 204; // No Content
     res.setHeader('Allow', ALLOWED_METHODS.join(', '));
@@ -335,6 +373,7 @@ const server = http.createServer((req, res) => {
  * Any other error falls through to a generic branch. All branches terminate the
  * process with `process.exit(1)`.
  *
+ * @callback ServerErrorListener
  * @param {NodeJS.ErrnoException} err - The error emitted by the server; its `code`
  *   property (e.g. `'EADDRINUSE'`, `'EACCES'`) drives the diagnosis.
  * @returns {void}
@@ -362,6 +401,7 @@ server.on('error', (err) => {
  * the server emits the `net.Server` `'listening'` event (bound on `hostname:port`);
  * it logs the listen URL and a hint that Ctrl+C triggers a graceful shutdown.
  *
+ * @callback ServerListeningListener
  * @returns {void}
  */
 server.listen(port, hostname, () => {
@@ -375,6 +415,7 @@ server.listen(port, hostname, () => {
  * managers and orchestrators (Docker, Kubernetes, PM2) to request an orderly
  * stop. This handler delegates to {@link gracefulShutdown} with the signal name.
  *
+ * @callback SigtermSignalListener
  * @returns {void}
  */
 process.on('SIGTERM', () => {
@@ -385,6 +426,7 @@ process.on('SIGTERM', () => {
  * Handles `SIGINT`, the interrupt signal raised when the user presses Ctrl+C in
  * an interactive terminal. Delegates to {@link gracefulShutdown}.
  *
+ * @callback SigintSignalListener
  * @returns {void}
  */
 process.on('SIGINT', () => {
@@ -397,6 +439,7 @@ process.on('SIGINT', () => {
  * stack, then attempts a graceful shutdown via {@link gracefulShutdown} if one is
  * not already in progress; otherwise it exits immediately with code 1.
  *
+ * @callback UncaughtExceptionListener
  * @param {Error} err - The uncaught error.
  * @returns {void}
  */
@@ -418,6 +461,7 @@ process.on('uncaughtException', (err) => {
  * reason, then attempts a graceful shutdown via {@link gracefulShutdown} if one
  * is not already underway; otherwise it exits with code 1.
  *
+ * @callback UnhandledRejectionListener
  * @param {*} reason - The rejection reason (any value passed to `reject`/thrown).
  * @param {Promise} promise - The promise that was rejected without a handler.
  * @returns {void}
