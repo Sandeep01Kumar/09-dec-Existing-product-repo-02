@@ -48,9 +48,11 @@ const SHUTDOWN_TIMEOUT = 5000; // 5 seconds timeout for graceful shutdown
 
 // Allowed HTTP methods for this server
 /**
- * HTTP verbs this server accepts. Any request whose method is not in this list
- * is rejected with a 405 Method Not Allowed response and an `Allow` header
- * enumerating these methods.
+ * HTTP verbs this server accepts. A request whose method is not in this list is
+ * rejected with a 405 Method Not Allowed response and an `Allow` header enumerating
+ * these methods — but only after the earlier stages of the request-decision cascade
+ * pass. The shutdown check (503) and URL validation (400) run first, so, for
+ * example, a `POST` carrying an over-length URL is answered with 400, not 405.
  * @constant {string[]}
  * @default ['GET', 'HEAD', 'OPTIONS']
  */
@@ -70,8 +72,15 @@ const MAX_URL_LENGTH = 2048;
 
 // Server state tracking
 /**
- * Whether a graceful shutdown is currently in progress. While `true`, the
- * request handler short-circuits new requests with 503 Service Unavailable.
+ * Whether a graceful shutdown is currently in progress. While `true`, any request
+ * that still reaches the request handler is answered with 503 Service Unavailable.
+ * Note that {@link gracefulShutdown} also calls `server.close()`, which stops the
+ * listening socket from accepting new connections; a brand-new connection opened
+ * during shutdown is therefore refused at the transport layer rather than answered
+ * with 503. In practice the 503 branch is only reached by a request that arrives on
+ * a connection accepted before `server.close()` took effect (for example an
+ * in-flight or already-established keep-alive connection), so it is race-dependent
+ * and not a guarantee to fresh clients.
  * @type {boolean}
  */
 let isShuttingDown = false;
@@ -92,8 +101,11 @@ let shutdownTimer = null;
  * 1. If a shutdown is already in progress ({@link isShuttingDown} is `true`), log
  *    that the trigger is being ignored and return immediately (idempotent early
  *    return).
- * 2. Set {@link isShuttingDown} to `true` (so the request handler begins replying
- *    503 to new requests) and log that graceful shutdown has started.
+ * 2. Set {@link isShuttingDown} to `true` (so any request that still reaches the
+ *    handler on an already-accepted connection is answered with 503; note that
+ *    step 4's `server.close()` simultaneously stops accepting new connections, so
+ *    fresh connections opened during shutdown are refused rather than given a 503)
+ *    and log that graceful shutdown has started.
  * 3. Arm a forced-exit timer for {@link SHUTDOWN_TIMEOUT} ms (5 seconds) and
  *    `unref()` it so the timer never keeps the event loop alive on its own. If the
  *    timer fires first, log the timeout and call `process.exit(1)`.
@@ -415,16 +427,21 @@ process.on('unhandledRejection', (reason, promise) => {
 /**
  * Public module exports, provided primarily for programmatic inspection and
  * control. Note that requiring this module has a side effect: `server.listen(...)`
- * runs at load time, so by the time these exports are accessible the server is
- * already listening on `hostname:port` (`server.listening === true`). Calling
- * `server.listen()` on it again would throw `ERR_SERVER_ALREADY_LISTEN`. (The
- * bundled `server.test.js` does not import these exports; it spawns `node
- * server.js` as a child process instead.)
+ * runs at load time, which *initiates* listening asynchronously. Listening is not
+ * established synchronously, so immediately after `require('./server')` the server
+ * is not yet bound: `server.listening` is `false` and `server.address()` returns
+ * `null` until Node emits the `'listening'` event on a later tick. Consumers that
+ * depend on the bound state must wait for that event (or poll `server.listening`)
+ * rather than assume the server is ready the moment `require` returns. (The bundled
+ * `server.test.js` does not import these exports; it spawns `node server.js` as a
+ * child process instead.)
  *
- * @property {http.Server} server - The already-started HTTP server instance,
- *   exposed so callers can inspect it (e.g. `server.listening`, `server.address()`),
- *   send requests to it, or close it via `server.close()`. It does not need to be
- *   started; it is listening as soon as this module has finished loading.
+ * @property {http.Server} server - The HTTP server instance whose `listen()` has
+ *   already been invoked at module load, exposed so callers can inspect it (e.g.
+ *   `server.listening`, `server.address()`), send requests to it once it is
+ *   listening, or close it via `server.close()`. Because binding completes
+ *   asynchronously, wait for the `'listening'` event before relying on
+ *   `server.address()` or issuing requests.
  * @property {function(string): void} gracefulShutdown - The shutdown trigger; call
  *   with a trigger label (e.g. `'SIGTERM'`) to begin an orderly shutdown. WARNING:
  *   this terminates the host process; it calls `process.exit(0)` on a clean drain
