@@ -39,26 +39,22 @@ A minimal, dependency-free, production-hardened Node.js HTTP server that respond
 ## Requirements
 
 - **Node.js v22.x** — verified on **v22.23.1**. `package.json` declares no `engines` field, so this is the tested version rather than an enforced floor.
-- **npm** — bundled with Node.js; used only to run the `start` and `test` scripts.
+- **npm** — bundled with Node.js; used for setup (`npm install`) and to run the `start` and `test` scripts.
 - **Zero external dependencies** — the server uses only the Node.js core `http` module, so there is nothing to download or build.
 
 `Source: package.json, package-lock.json`
 
 ## Installation & Setup
 
-Clone the repository, install dependencies (a no-op here — the project has **zero** dependencies), and start the server:
+Obtain the source (clone or download this repository) and change into the project root (the directory that contains `server.js`). Then install dependencies (a no-op here — the project has **zero** dependencies), and start the server:
 
 ```bash
-# 1. Clone the repository
-git clone <repository-url>
-cd hello_world
-
-# 2. Install dependencies
+# 1. Install dependencies
 #    This is effectively a no-op: package-lock.json lists no third-party
 #    packages, so npm has nothing to download.
 npm install
 
-# 3. Start the server
+# 2. Start the server
 npm start
 ```
 
@@ -99,7 +95,7 @@ Hello, World!
 
 ### Routing model
 
-This server is a **catch-all**: it performs **no path routing**. The request path is never inspected, so `/`, `/test`, `/api`, and `/any/deep/path` all produce the same response for a given HTTP method. This behavior is verified by the test suite's multi-path routing test (Test 8).
+This server is a **catch-all**: it performs **no path-specific routing**. It does not match the request path against any route table, so `/`, `/test`, `/api`, and `/any/deep/path` all produce the same response for a given HTTP method. The URL is still validated for length and null bytes, so an overlong URL — or one containing a null byte — is rejected with `400 Bad Request` regardless of its path. This behavior is verified by the test suite's multi-path routing test (Test 8).
 
 `Source: server.js:L150-L212`
 
@@ -111,7 +107,8 @@ This server is a **catch-all**: it performs **no path routing**. The request pat
 | `HEAD` (any path) | `200 OK` | `Content-Type: text/plain`, `Content-Length: 14` | *(no body)* |
 | `OPTIONS` (any path) | `204 No Content` | `Allow: GET, HEAD, OPTIONS`, `Content-Length: 0` | *(none)* |
 | `POST` / `PUT` / `DELETE` / other | `405 Method Not Allowed` | `Allow: GET, HEAD, OPTIONS` | `Method Not Allowed\n` |
-| Invalid URL (> 2048 chars or null byte) | `400 Bad Request` | `Content-Type: text/plain` | `Bad Request - <reason>\n` |
+| Invalid URL (> 2048 chars) | `400 Bad Request` | `Content-Type: text/plain` | `Bad Request - URL exceeds maximum length of 2048 characters\n` |
+| Invalid URL (contains a null byte) | `400 Bad Request` | `Content-Type: text/plain` | `Bad Request - URL contains invalid null bytes\n` |
 | Request received while shutting down | `503 Service Unavailable` | `Connection: close`, `Retry-After: 30` | `Service Unavailable - Server is shutting down\n` |
 
 `Source: server.js:L150-L212` (handler), `server.js:L166-L188` (503 / 400 / 405 paths).
@@ -187,9 +184,59 @@ Content-Length: 60
 Bad Request - URL exceeds maximum length of 2048 characters
 ```
 
-**503 Service Unavailable** is returned for any request that arrives *after* a shutdown signal has been received (while the server is draining connections). It carries `Connection: close` and `Retry-After: 30`. See [Deployment & Operations](#deployment--operations).
+**503 Service Unavailable — request received during shutdown**
 
-`Source: server.js:L122-L188`
+While the server is shutting down (`isShuttingDown === true`), the request handler answers any request that still reaches it with `503`, setting `Content-Type: text/plain`, `Connection: close`, and `Retry-After: 30`:
+
+```http
+HTTP/1.1 503 Service Unavailable
+Content-Type: text/plain
+Connection: close
+Retry-After: 30
+
+Service Unavailable - Server is shutting down
+```
+
+> **A fresh `curl` issued after the signal does *not* observe this `503` — it sees a connection error instead.** Graceful shutdown calls `server.close()`, which stops accepting **new** connections and drops idle keep-alive connections. A `curl` started *after* the signal therefore opens a new connection and is refused (`ECONNREFUSED`), and a client reusing a now-closed keep-alive connection sees a reset (`ECONNRESET`) — not a `503`. The `503` above is what the handler emits for a request that is already in flight (has reached the handler) at the instant the shutdown state flips. See [Deployment & Operations](#deployment--operations).
+
+Because that in-flight window is not reliably reproducible from an external client, the controlled reproduction below drives the exported handler directly: it starts the server, flips it into the shutting-down state via the exported `gracefulShutdown()`, then invokes the request handler once and prints the exact `503` shown above. Save it as `repro-503.js` in the project root and run `node repro-503.js`:
+
+```js
+const EventEmitter = require('events');
+// Importing the module starts the server listening on 127.0.0.1:3000.
+const { server, gracefulShutdown } = require('./server.js');
+
+server.on('listening', () => {
+  gracefulShutdown('SIGTERM');                     // enter the shutting-down state
+  const handler = server.listeners('request')[0];  // the http.createServer callback
+
+  // Minimal stand-ins for http.IncomingMessage / http.ServerResponse:
+  const req = Object.assign(new EventEmitter(), { url: '/', method: 'GET' });
+  const res = Object.assign(new EventEmitter(), {
+    statusCode: 200,
+    headersSent: false,
+    _headers: {},
+    setHeader(name, value) { this._headers[name] = value; },
+    end(body) {
+      console.log('status  =', this.statusCode);
+      console.log('headers =', JSON.stringify(this._headers));
+      console.log('body    =', JSON.stringify(body));
+    },
+  });
+
+  handler(req, res);
+});
+```
+
+Expected output (interleaved with the server's own startup and shutdown log lines):
+
+```text
+status  = 503
+headers = {"Content-Type":"text/plain","Connection":"close","Retry-After":"30"}
+body    = "Service Unavailable - Server is shutting down\n"
+```
+
+`Source: server.js:L150-L212` (request handler); `server.js:L166-L172` (the `503` shutting-down branch).
 
 ## Configuration
 
@@ -224,7 +271,8 @@ flowchart TD
 
 ## Deployment & Operations
 
-- **Loopback-only by default.** The server binds to `127.0.0.1`, so it is **not reachable from other hosts** out of the box. To expose it publicly, place a reverse proxy (nginx, Caddy) in front of it, or change the bind address in `server.js`. `Source: server.js:L26`
+- **Loopback-only by default.** The server binds to `127.0.0.1`, so it is **not reachable from other hosts** out of the box. `Source: server.js:L26`
+- **Public exposure — security caveat.** This server speaks **plain HTTP and implements no authentication, no authorization, and no rate limiting, and it terminates no TLS**. Changing the bind address to a non-loopback interface (for example `0.0.0.0`) therefore publishes an **unauthenticated, unencrypted** service to every host that can reach that interface. Do not bind it to a public interface directly. Keep it on `127.0.0.1` and put a **TLS-terminating reverse proxy** (nginx, Caddy) in front of it to handle HTTPS and access control, and restrict inbound traffic with a **firewall / security group**. The application adds none of these protections itself.
 - **Graceful shutdown.** `SIGTERM` (sent by process managers such as Docker, Kubernetes, and PM2) and `SIGINT` (Ctrl+C in a terminal) both invoke `gracefulShutdown()`. It stops accepting new connections via `server.close()`, waits for in-flight requests to finish, and force-exits after `SHUTDOWN_TIMEOUT` (5000 ms) if connections have not drained. A clean shutdown exits with code `0`. Observed stdout:
 
   ```text
@@ -242,7 +290,7 @@ flowchart TD
 
   `Source: server.js:L224-L240`
 - **Crash safety.** Process-level handlers for `uncaughtException` and `unhandledRejection` log the error (message, stack, and offending promise/reason) and attempt a graceful shutdown rather than crashing silently. `Source: server.js:L290-L323`
-- **Process-manager guidance.** Because the server honors `SIGTERM`, it integrates cleanly with process managers and orchestrators. Under **Docker**, `docker stop` sends `SIGTERM` (giving the container its grace period before `SIGKILL`); **Kubernetes** sends `SIGTERM` on pod termination; **PM2** and **systemd** likewise deliver `SIGTERM` on stop/restart. No extra configuration is required — the built-in graceful-shutdown path handles all of them.
+- **Process-manager guidance.** The server honors `SIGTERM` and `SIGINT` (`Source: server.js:L264-L278`), so it can integrate with process managers and orchestrators — **but only when the signal is actually delivered to the Node process.** Signal delivery depends on how the process is launched: under **Docker**, `docker stop` sends `SIGTERM` to PID 1, so start Node with the **exec form** `CMD ["node", "server.js"]` (the shell form `CMD node server.js` runs under `/bin/sh -c`, which does **not** forward signals to the child), or run with an init such as `tini` (`docker run --init`) so PID 1 forwards signals. **Kubernetes** sends `SIGTERM` on pod termination, and **PM2** and **systemd** deliver `SIGTERM` on stop/restart — each subject to the same requirement that the signal reach the Node process. **This repository ships no deployment manifests** (no Dockerfile, Compose file, Kubernetes manifest, PM2 ecosystem file, or systemd unit); you must supply those for your platform and confirm that `SIGTERM` / `SIGINT` reaches Node so the graceful-shutdown path runs.
 
 The following diagram models the graceful-shutdown lifecycle.
 
@@ -281,7 +329,7 @@ sequenceDiagram
 7. **`listen` callback.** Once the server is bound, it logs the startup banner and the Ctrl+C hint. `Source: server.js:L250-L253`
 8. **Signal handlers.** `process.on('SIGTERM', ...)` and `process.on('SIGINT', ...)` each delegate to `gracefulShutdown()` with the corresponding signal name. `Source: server.js:L264-L278`
 9. **Process-level handlers.** `uncaughtException` and `unhandledRejection` log diagnostics and attempt a graceful shutdown, guarding against silent crashes. `Source: server.js:L290-L323`
-10. **Exports.** `module.exports = { server, gracefulShutdown }` exposes the server instance and shutdown routine so the test suite can drive them directly. `Source: server.js:L326`
+10. **Exports.** `module.exports = { server, gracefulShutdown }` exposes the server instance and shutdown routine to programmatic consumers and future in-process tests. The current test suite does **not** import these exports — it runs the server as a child process (`spawn('node', [server.js])`) and drives it over HTTP requests and OS signals (`serverProcess.kill(...)`). `Source: server.js:L326` (exports); `Source: server.test.js:L16, L76` (child-process harness).
 
 `Source: server.js:L1-L326`
 
@@ -314,7 +362,7 @@ The 10 tests cover:
 9. `SIGTERM` graceful shutdown (clean exit, shutdown message).
 10. `SIGINT` graceful shutdown (clean exit, shutdown message).
 
-> **Platform note.** Tests 9 and 10 assert graceful shutdown by delivering `SIGTERM`/`SIGINT` to a spawned child process. POSIX signals are catchable on Linux/macOS, so all 10 tests pass there. On native Windows, Node.js cannot deliver a catchable `SIGTERM`/`SIGINT` to a child process (the call is mapped to an unconditional process termination), so those two signal tests do not pass on Windows even though the server's shutdown code is correct. Run the suite on Linux/macOS (or under WSL/Docker) to reproduce `10 passed, 0 failed`.
+> **Platform note.** Tests 9 and 10 assert graceful shutdown by delivering `SIGTERM`/`SIGINT` to a spawned child process. POSIX signals are catchable on Linux/macOS, so all 10 tests pass there. On native Windows, Node.js cannot deliver a catchable `SIGTERM`/`SIGINT` to a child process (the call is mapped to an unconditional process termination), so those two signal tests do not pass on Windows even though the server's shutdown code is correct. Run the suite on Linux/macOS (or under WSL/Docker) to reproduce `10 passed, 0 failed`. This was verified on Linux (WSL2, Ubuntu 24.04) with the documented Node.js v22.23.1, where the suite exits with code `0` and all 10 tests pass, including the two signal tests.
 
 `Source: server.test.js`
 

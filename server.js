@@ -133,9 +133,9 @@ function sendErrorResponse(res, statusCode, message, additionalHeaders = {}) {
 
 /**
  * HTTP request handler for every incoming request. This is a catch-all
- * handler: there is no path routing, so the request path never selects
- * behavior and all URLs behave identically. The response instead depends on
- * the server's shutdown state, the URL's validity, and the request method.
+ * handler with no path-based routing: the request path never selects a route,
+ * so all valid paths share the same per-method behavior. Every URL is still
+ * validated, and an overlong or null-byte URL yields 400 regardless of path.
  *
  * Decision order: attaches req/res error listeners -> responds 503 if the
  * server is shutting down -> 400 on an invalid URL -> 405 if the method is not
