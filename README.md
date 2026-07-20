@@ -24,7 +24,7 @@ A minimal, dependency-free, production-hardened Node.js HTTP server that respond
 ## Features / Behavior Overview
 
 - **Catch-all "Hello, World!" server.** There is **no path routing** — every request path (`/`, `/test`, `/api`, `/any/path`) behaves identically. The response is selected entirely by shutdown state, URL validity, and HTTP method, never by the path.
-- **Allowed HTTP methods:** `GET`, `HEAD`, and `OPTIONS`. Any other method receives `405 Method Not Allowed`.
+- **Allowed HTTP methods:** `GET`, `HEAD`, and `OPTIONS`. Any other method that reaches the request handler (for example `POST`, `PUT`, or `DELETE`) receives `405 Method Not Allowed`. The `CONNECT` method is a special case that Node.js handles before the handler runs, so it does **not** produce a `405` — see the notes under [Method contract](#method-contract).
 - **Production hardening baked in:**
   - Server-level error handling for startup/bind errors (`EADDRINUSE`, `EACCES`).
   - Per-request error listeners on both the request and response streams.
@@ -34,7 +34,7 @@ A minimal, dependency-free, production-hardened Node.js HTTP server that respond
   - Process-level handlers for `uncaughtException` and `unhandledRejection`.
 - **Zero dependencies.** The only module required at runtime is the Node.js built-in `http`.
 
-`Source: server.js:L33, L209-L211` (allowed methods and the `Hello, World!` response); `Source: server.js:L1-L21` (feature summary in the module header).
+`Source: server.js:L33, L253-L255` (allowed methods and the `Hello, World!` response); `Source: server.js:L1-L21` (feature summary in the module header).
 
 ## Requirements
 
@@ -89,7 +89,7 @@ curl http://127.0.0.1:3000/
 Hello, World!
 ```
 
-`Source: server.js:L250-L253`
+`Source: server.js:L294-L297`
 
 ## API Documentation
 
@@ -97,7 +97,7 @@ Hello, World!
 
 This server is a **catch-all**: it performs **no path-specific routing**. It does not match the request path against any route table, so `/`, `/test`, `/api`, and `/any/deep/path` all produce the same response for a given HTTP method. The URL is still validated for length and null bytes, so an overlong URL — or one containing a null byte — is rejected with `400 Bad Request` regardless of its path. This behavior is verified by the test suite's multi-path routing test (Test 8).
 
-`Source: server.js:L150-L212`
+`Source: server.js:L176-L256`
 
 ### Method contract
 
@@ -106,18 +106,24 @@ This server is a **catch-all**: it performs **no path-specific routing**. It doe
 | `GET` (any path) | `200 OK` | `Content-Type: text/plain`, `Content-Length: 14` | `Hello, World!\n` |
 | `HEAD` (any path) | `200 OK` | `Content-Type: text/plain`, `Content-Length: 14` | *(no body)* |
 | `OPTIONS` (any path) | `204 No Content` | `Allow: GET, HEAD, OPTIONS`, `Content-Length: 0` | *(none)* |
-| `POST` / `PUT` / `DELETE` / other | `405 Method Not Allowed` | `Allow: GET, HEAD, OPTIONS` | `Method Not Allowed\n` |
-| Invalid URL (> 2048 chars) | `400 Bad Request` | `Content-Type: text/plain` | `Bad Request - URL exceeds maximum length of 2048 characters\n` |
+| `POST` / `PUT` / `DELETE` / any other method delivered to the handler | `405 Method Not Allowed` | `Content-Type: text/plain`, `Allow: GET, HEAD, OPTIONS` | `Method Not Allowed\n` |
+| Invalid URL (> 2048 chars, within Node's header-size limit) | `400 Bad Request` | `Content-Type: text/plain` | `Bad Request - URL exceeds maximum length of 2048 characters\n` |
 | Invalid URL (contains a raw null byte) — *see note below the table* | `400 Bad Request` | `Connection: close` | *(empty from a standard HTTP client)* |
 | Request received while shutting down | `503 Service Unavailable` | `Connection: close`, `Retry-After: 30` | `Service Unavailable - Server is shutting down\n` |
 
-`Source: server.js:L150-L212` (handler), `server.js:L166-L188` (503 / 400 / 405 paths).
+`Source: server.js:L176-L256` (handler), `server.js:L210-L232` (503 / 400 / 405 paths).
 
-> **Note on the null-byte row.** A *raw* null byte in the request target is rejected by Node.js's built-in HTTP parser *before* the request ever reaches this application's handler, so a standard HTTP client observes only a bare `HTTP/1.1 400 Bad Request` with `Connection: close` and an **empty body** (no `Content-Type`). The application's own null-byte guard in `validateUrl` — which produces the body `Bad Request - URL contains invalid null bytes\n` with `Content-Type: text/plain` — is a **defensive validation layer** that a standard HTTP client cannot reach; it runs only when the exported request handler is invoked directly (for example, from a unit test). This parallels the layering caveat noted for the `503` response in the examples below. A *percent-encoded* `%00` is not a literal null byte, so it passes validation and receives the normal catch-all `200 OK` response. `Source: server.js:L101-L107` (validateUrl null-byte branch), `server.js:L174-L180` (handler 400 path).
+> **Note on the null-byte row.** A *raw* null byte in the request target is rejected by Node.js's built-in HTTP parser *before* the request ever reaches this application's handler, so a standard HTTP client observes only a bare `HTTP/1.1 400 Bad Request` with `Connection: close` and an **empty body** (no `Content-Type`). The application's own null-byte guard in `validateUrl` — which produces the body `Bad Request - URL contains invalid null bytes\n` with `Content-Type: text/plain` — is a **defensive validation layer** that a standard HTTP client cannot reach; it runs only when the request listener — obtained from the exported `server` instance via `server.listeners('request')[0]` — is invoked directly (for example, from a unit test). This parallels the layering caveat noted for the `503` response in the examples below. A *percent-encoded* `%00` is not a literal null byte, so it passes validation and receives the normal catch-all `200 OK` response. `Source: server.js:L119-L125` (validateUrl null-byte branch), `server.js:L218-L224` (handler 400 path).
+
+> **Note on `CONNECT`, `HEAD` error bodies, and oversized request targets.** These three behaviors are not captured by the per-method rows above:
+>
+> - **`CONNECT` is never answered with `405`.** Node.js dispatches `CONNECT` requests through a separate `'connect'` event instead of the normal request listener. This server registers no `'connect'` handler, so a `CONNECT` request never reaches the handler: Node closes the connection with **no HTTP response** at all (a client observes zero response bytes and a closed socket), not a `405`. `Source: server.js:L176-L256` (the request listener registers no `'connect'` handler).
+> - **`HEAD` responses never include a body — even on error paths.** For a `HEAD` request, Node.js suppresses the response body on *every* branch. A `HEAD` that would otherwise return `400` (invalid URL) or `503` (shutting down) still sends the correct status line and headers, but **no body and no `Content-Length`** for the would-be error text. `Source: server.js:L243-L250` (HEAD branch).
+> - **Very large request targets return `431`, not `400`.** The application's URL-length check (`> 2048` → `400`) only runs once a request reaches the handler. A request *target* long enough to exceed Node's built-in HTTP header-size limit (~16 KB by default) is rejected earlier by Node's own parser with `431 Request Header Fields Too Large` and an empty body, before the application's `400` check runs. Request targets longer than 2048 characters but still within the parser limit receive the application's `400 Bad Request`. `Source: server.js:L218-L224` (URL validation → `400`); `server.js:L36` (`MAX_URL_LENGTH`).
 
 ### Examples
 
-Each example below is a copy-paste-runnable `curl` command with its observed response. (For brevity, the auto-generated `Date`, `Connection`, and `Keep-Alive` headers Node adds are omitted; the semantically relevant headers are shown.)
+Each example below is a copy-paste-runnable `curl` command with its observed response. (For brevity, the auto-generated `Date` and `Keep-Alive` headers Node adds are omitted, along with `Connection` where it merely carries the default keep-alive value; the semantically relevant headers — including `Content-Type` and `Content-Length` — are shown.)
 
 **GET — 200 OK**
 
@@ -165,6 +171,7 @@ curl -i -X POST http://127.0.0.1:3000/
 
 ```http
 HTTP/1.1 405 Method Not Allowed
+Content-Type: text/plain
 Allow: GET, HEAD, OPTIONS
 Content-Length: 19
 
@@ -195,13 +202,14 @@ HTTP/1.1 503 Service Unavailable
 Content-Type: text/plain
 Connection: close
 Retry-After: 30
+Content-Length: 46
 
 Service Unavailable - Server is shutting down
 ```
 
-> **A fresh `curl` issued after the signal does *not* observe this `503` — it sees a connection error instead.** Graceful shutdown calls `server.close()`, which stops accepting **new** connections and drops idle keep-alive connections. A `curl` started *after* the signal therefore opens a new connection and is refused (`ECONNREFUSED`), and a client reusing a now-closed keep-alive connection sees a reset (`ECONNRESET`) — not a `503`. The `503` above is what the handler emits for a request that is already in flight (has reached the handler) at the instant the shutdown state flips. See [Deployment & Operations](#deployment--operations).
+> **A fresh `curl` issued after the signal does *not* observe this `503` — it sees a connection error instead.** Graceful shutdown calls `server.close()`, which stops accepting **new** connections and drops idle keep-alive connections. A `curl` started *after* the signal therefore opens a new connection and is refused (`ECONNREFUSED`), and a client reusing a now-closed keep-alive connection sees a reset (`ECONNRESET`) — not a `503`. The `503` above is emitted when a request is dispatched to the handler **after** `isShuttingDown` has flipped to `true`, on a connection that was already open before the signal arrived: `server.close()` refuses *new* connections but does not sever an established one, so a request sent on that pre-existing connection still reaches the handler, which then answers `503`. See [Deployment & Operations](#deployment--operations).
 
-Because that in-flight window is not reliably reproducible from an external client, the controlled reproduction below drives the exported handler directly: it starts the server, flips it into the shutting-down state via the exported `gracefulShutdown()`, then invokes the request handler once and prints the exact `503` shown above. Save it as `repro-503.js` in the project root and run `node repro-503.js`:
+That `503` path **is** reproducible from an external client: open a TCP connection, send the request line and headers *without* the final blank line, deliver `SIGTERM`/`SIGINT` to the process, and only then send the terminating blank line. Because the connection was established before the signal, the completed request is dispatched to the handler after `isShuttingDown` has flipped, and the client receives the `503` shown above; this sequence reproduces deterministically. The self-contained script below reproduces the same result at the unit level without any socket timing: it starts the server, flips it into the shutting-down state via the exported `gracefulShutdown()`, obtains the request listener from the exported `server` instance (`server.listeners('request')[0]`), then invokes it once and prints the exact `503` shown above. Save it as `repro-503.js` in the project root and run `node repro-503.js`:
 
 ```js
 const EventEmitter = require('events');
@@ -238,7 +246,7 @@ headers = {"Content-Type":"text/plain","Connection":"close","Retry-After":"30"}
 body    = "Service Unavailable - Server is shutting down\n"
 ```
 
-`Source: server.js:L150-L212` (request handler); `server.js:L166-L172` (the `503` shutting-down branch).
+`Source: server.js:L176-L256` (request handler); `server.js:L210-L216` (the `503` shutting-down branch).
 
 ## Configuration
 
@@ -269,7 +277,7 @@ flowchart TD
     F -- "other" --> J["405 Method Not Allowed<br/>Allow header"]
 ```
 
-`Source: server.js:L150-L212`
+`Source: server.js:L176-L256`
 
 ## Deployment & Operations
 
@@ -282,7 +290,7 @@ flowchart TD
   Server closed successfully. All connections terminated.
   ```
 
-  (`SIGINT` prints `SIGINT received. Starting graceful shutdown...`.) `Source: server.js:L52-L83, L264-L278`
+  (`SIGINT` prints `SIGINT received. Starting graceful shutdown...`.) `Source: server.js:L52-L101, L308-L322`
 - **Startup / bind errors.** If the port is already in use (`EADDRINUSE`) or binding is not permitted (`EACCES`, e.g. a privileged port `< 1024`), the server logs a diagnostic and exits with code `1`. Example stderr for a busy port:
 
   ```text
@@ -290,9 +298,9 @@ flowchart TD
   Please stop the other process using this port or use a different port.
   ```
 
-  `Source: server.js:L224-L240`
-- **Crash safety.** Process-level handlers for `uncaughtException` and `unhandledRejection` log the error (message, stack, and offending promise/reason) and attempt a graceful shutdown rather than crashing silently. `Source: server.js:L290-L323`
-- **Process-manager guidance.** The server honors `SIGTERM` and `SIGINT` (`Source: server.js:L264-L278`), so it can integrate with process managers and orchestrators — **but only when the signal is actually delivered to the Node process.** Signal delivery depends on how the process is launched: under **Docker**, `docker stop` sends `SIGTERM` to PID 1, so start Node with the **exec form** `CMD ["node", "server.js"]` (the shell form `CMD node server.js` runs under `/bin/sh -c`, which does **not** forward signals to the child), or run with an init such as `tini` (`docker run --init`) so PID 1 forwards signals. **Kubernetes** sends `SIGTERM` on pod termination, and **PM2** and **systemd** deliver `SIGTERM` on stop/restart — each subject to the same requirement that the signal reach the Node process. **This repository ships no deployment manifests** (no Dockerfile, Compose file, Kubernetes manifest, PM2 ecosystem file, or systemd unit); you must supply those for your platform and confirm that `SIGTERM` / `SIGINT` reaches Node so the graceful-shutdown path runs.
+  `Source: server.js:L268-L284`
+- **Crash safety.** Process-level handlers for `uncaughtException` and `unhandledRejection` log the error (message, stack, and offending promise/reason) and attempt a graceful shutdown rather than crashing silently. `Source: server.js:L334-L367`
+- **Process-manager guidance.** The server honors `SIGTERM` and `SIGINT` (`Source: server.js:L308-L322`), so it can integrate with process managers and orchestrators — **but only when the signal is actually delivered to the Node process.** Signal delivery depends on how the process is launched: under **Docker**, `docker stop` sends `SIGTERM` to PID 1, so start Node with the **exec form** `CMD ["node", "server.js"]` (the shell form `CMD node server.js` runs under `/bin/sh -c`, which does **not** forward signals to the child), or run with an init such as `tini` (`docker run --init`) so PID 1 forwards signals. **Kubernetes** sends `SIGTERM` on pod termination, and **PM2** and **systemd** deliver `SIGTERM` on stop/restart — each subject to the same requirement that the signal reach the Node process. **This repository ships no deployment manifests** (no Dockerfile, Compose file, Kubernetes manifest, PM2 ecosystem file, or systemd unit); you must supply those for your platform and confirm that `SIGTERM` / `SIGINT` reaches Node so the graceful-shutdown path runs.
 
 The following diagram models the graceful-shutdown lifecycle.
 
@@ -313,7 +321,7 @@ sequenceDiagram
     end
 ```
 
-`Source: server.js:L52-L83` (`gracefulShutdown`), `server.js:L264-L278` (signal handlers).
+`Source: server.js:L52-L101` (`gracefulShutdown`), `server.js:L308-L322` (signal handlers).
 
 ## Code Walkthrough
 
@@ -323,17 +331,17 @@ sequenceDiagram
 2. **Configuration constants.** `hostname`, `port`, `SHUTDOWN_TIMEOUT`, `ALLOWED_METHODS`, and `MAX_URL_LENGTH` are declared as constants — the single place to tune the server's behavior. `Source: server.js:L25-L36`
 3. **Module state.** Two mutable module-level variables track lifecycle: `isShuttingDown` (a boolean guard that flips once a shutdown begins) and `shutdownTimer` (the handle for the force-exit timeout). `Source: server.js:L39-L40`
 4. **Helper functions.**
-   - `gracefulShutdown(signal)` — idempotent (repeat calls are ignored while a shutdown is in progress). It sets the force-exit timer, calls `server.close()`, and exits with code `0` once connections drain. `Source: server.js:L52-L83`
-   - `validateUrl(url)` — returns `{ valid: boolean, error?: string }`, rejecting URLs over `MAX_URL_LENGTH` characters or containing a null byte. `Source: server.js:L92-L110`
-   - `sendErrorResponse(res, statusCode, message, additionalHeaders = {})` — writes a plain-text error response, applying any extra headers and appending a trailing newline. `Source: server.js:L122-L132`
-5. **Request handler.** `http.createServer((req, res) => { ... })` first attaches `error` listeners to `req` and `res`, then applies the decision order: **503** if shutting down → **400** on an invalid URL → **405** if the method is not allowed → **204** for `OPTIONS` → **200** headers-only for `HEAD` → **200** with `Hello, World!\n` for `GET`. `Source: server.js:L150-L212`
-6. **Server `'error'` handler.** Diagnoses `EADDRINUSE` and `EACCES` specifically, logs the cause, and calls `process.exit(1)`. `Source: server.js:L224-L240`
-7. **`listen` callback.** Once the server is bound, it logs the startup banner and the Ctrl+C hint. `Source: server.js:L250-L253`
-8. **Signal handlers.** `process.on('SIGTERM', ...)` and `process.on('SIGINT', ...)` each delegate to `gracefulShutdown()` with the corresponding signal name. `Source: server.js:L264-L278`
-9. **Process-level handlers.** `uncaughtException` and `unhandledRejection` log diagnostics and attempt a graceful shutdown, guarding against silent crashes. `Source: server.js:L290-L323`
-10. **Exports.** `module.exports = { server, gracefulShutdown }` exposes the server instance and shutdown routine to programmatic consumers and future in-process tests. The current test suite does **not** import these exports — it runs the server as a child process (`spawn('node', [server.js])`) and drives it over HTTP requests and OS signals (`serverProcess.kill(...)`). `Source: server.js:L326` (exports); `Source: server.test.js:L16, L76` (child-process harness).
+   - `gracefulShutdown(signal)` — idempotent (repeat calls are ignored while a shutdown is in progress). It sets the force-exit timer, calls `server.close()`, and exits with code `0` once connections drain. `Source: server.js:L52-L101`
+   - `validateUrl(url)` — returns `{ valid: boolean, error?: string }`, rejecting URLs over `MAX_URL_LENGTH` characters or containing a null byte. `Source: server.js:L110-L128`
+   - `sendErrorResponse(res, statusCode, message, additionalHeaders = {})` — writes a plain-text error response, applying any extra headers and appending a trailing newline. `Source: server.js:L140-L158`
+5. **Request handler.** `http.createServer((req, res) => { ... })` first attaches `error` listeners to `req` and `res`, then applies the decision order: **503** if shutting down → **400** on an invalid URL → **405** if the method is not allowed → **204** for `OPTIONS` → **200** headers-only for `HEAD` → **200** with `Hello, World!\n` for `GET`. `Source: server.js:L176-L256`
+6. **Server `'error'` handler.** Diagnoses `EADDRINUSE` and `EACCES` specifically, logs the cause, and calls `process.exit(1)`. `Source: server.js:L268-L284`
+7. **`listen` callback.** Once the server is bound, it logs the startup banner and the Ctrl+C hint. `Source: server.js:L294-L297`
+8. **Signal handlers.** `process.on('SIGTERM', ...)` and `process.on('SIGINT', ...)` each delegate to `gracefulShutdown()` with the corresponding signal name. `Source: server.js:L308-L322`
+9. **Process-level handlers.** `uncaughtException` and `unhandledRejection` log diagnostics and attempt a graceful shutdown, guarding against silent crashes. `Source: server.js:L334-L367`
+10. **Exports.** `module.exports = { server, gracefulShutdown }` exposes the server instance and shutdown routine to programmatic consumers and future in-process tests. The current test suite does **not** import these exports — it runs the server as a child process (`spawn('node', [server.js])`) and drives it over HTTP requests and OS signals (`serverProcess.kill(...)`). `Source: server.js:L370` (exports); `Source: server.test.js:L16, L76` (child-process harness).
 
-`Source: server.js:L1-L326`
+`Source: server.js:L1-L370`
 
 ## Testing
 

@@ -17,7 +17,7 @@
  *
  * @module server
  * @requires http
- * Source: server.js:L1-L326
+ * Source: server.js:L1-L370
  */
 
 const http = require('http');
@@ -47,7 +47,7 @@ let shutdownTimer = null;
  *
  * @param {string} signal - The signal that triggered the shutdown (e.g. 'SIGTERM', 'SIGINT').
  * @returns {void} - No value is returned; the process exits asynchronously once connections drain or the timeout fires.
- * Source: server.js:L52-L83
+ * Source: server.js:L52-L101
  */
 function gracefulShutdown(signal) {
   // Prevent multiple shutdown attempts
@@ -59,7 +59,15 @@ function gracefulShutdown(signal) {
   isShuttingDown = true;
   console.log(`${signal} received. Starting graceful shutdown...`);
 
-  // Set a timeout to force exit if graceful shutdown takes too long
+  /**
+   * Force-exit timer callback. Scheduled via `setTimeout` to fire after
+   * `SHUTDOWN_TIMEOUT` milliseconds; if the graceful shutdown has not
+   * completed by then, it logs the timeout to stderr and forces the
+   * process to exit. Takes no arguments.
+   *
+   * @returns {void} - No value is returned; it terminates the process via `process.exit(1)`.
+   * Source: server.js:L71-L74
+   */
   shutdownTimer = setTimeout(() => {
     console.error(`Shutdown timeout (${SHUTDOWN_TIMEOUT}ms) exceeded. Forcing exit.`);
     process.exit(1);
@@ -68,7 +76,17 @@ function gracefulShutdown(signal) {
   // Unref the timer so it doesn't keep the process alive
   shutdownTimer.unref();
 
-  // Stop accepting new connections and wait for existing ones to complete
+  /**
+   * `server.close()` completion callback. Invoked once the server has
+   * stopped accepting new connections and all in-flight connections have
+   * drained (or immediately with an error if the server was not listening).
+   * Clears the force-exit timer and exits the process: code 1 on error,
+   * code 0 on a clean close.
+   *
+   * @param {Error} [err] - Present only when closing the server failed (e.g. it was not running).
+   * @returns {void} - No value is returned; it terminates the process via `process.exit()`.
+   * Source: server.js:L90-L100
+   */
   server.close((err) => {
     if (err) {
       console.error('Error during server close:', err.message);
@@ -87,7 +105,7 @@ function gracefulShutdown(signal) {
  *
  * @param {string} url - The request URL to validate.
  * @returns {{valid: boolean, error?: string}} - Validation result; `valid` is false with an `error` message when the URL exceeds MAX_URL_LENGTH characters or contains a null byte.
- * Source: server.js:L92-L110
+ * Source: server.js:L110-L128
  */
 function validateUrl(url) {
   // Check URL length
@@ -117,13 +135,21 @@ function validateUrl(url) {
  * @param {string} message - The plain-text error message (a trailing newline is appended).
  * @param {Object<string,string>} [additionalHeaders={}] - Optional extra response headers to set.
  * @returns {void} - No value is returned; the response is written and ended as a side effect.
- * Source: server.js:L122-L132
+ * Source: server.js:L140-L158
  */
 function sendErrorResponse(res, statusCode, message, additionalHeaders = {}) {
   res.statusCode = statusCode;
   res.setHeader('Content-Type', 'text/plain');
   
-  // Add any additional headers
+  /**
+   * Per-entry callback for the `Object.entries(additionalHeaders).forEach`
+   * iteration. Applies one caller-supplied header to the response.
+   *
+   * @param {string} key - The header name (first element of the destructured `[key, value]` entry).
+   * @param {string} value - The header value (second element of the destructured `[key, value]` entry).
+   * @returns {void} - No value is returned; it sets one response header via `res.setHeader`.
+   * Source: server.js:L153-L155
+   */
   Object.entries(additionalHeaders).forEach(([key, value]) => {
     res.setHeader(key, value);
   });
@@ -145,10 +171,19 @@ function sendErrorResponse(res, statusCode, message, additionalHeaders = {}) {
  * @param {http.IncomingMessage} req - The incoming HTTP request.
  * @param {http.ServerResponse} res - The outgoing HTTP response.
  * @returns {void} - No value is returned; the response is produced entirely via side effects on `res`.
- * Source: server.js:L150-L212
+ * Source: server.js:L176-L256
  */
 const server = http.createServer((req, res) => {
-  // Handle request errors (e.g., client disconnection during upload)
+  /**
+   * Request-stream `'error'` event handler. Handles errors on the incoming
+   * request stream (for example, a client disconnecting mid-upload) by
+   * logging the error to stderr and, when no response has been sent yet,
+   * replying with a `400 Bad Request`.
+   *
+   * @param {Error} err - The error emitted on the request stream.
+   * @returns {void} - No value is returned; it logs and may send a 400 response as a side effect.
+   * Source: server.js:L187-L193
+   */
   req.on('error', (err) => {
     console.error('Request error:', err.message);
     // Only try to send error if headers haven't been sent
@@ -157,7 +192,16 @@ const server = http.createServer((req, res) => {
     }
   });
 
-  // Handle response errors (e.g., connection closed while sending)
+  /**
+   * Response-stream `'error'` event handler. Handles errors on the outgoing
+   * response stream (for example, the connection closing while the response
+   * is being written) by logging the error to stderr. It does not attempt to
+   * send a further response.
+   *
+   * @param {Error} err - The error emitted on the response stream.
+   * @returns {void} - No value is returned; it only logs the error to stderr.
+   * Source: server.js:L205-L207
+   */
   res.on('error', (err) => {
     console.error('Response error:', err.message);
   });
@@ -219,7 +263,7 @@ const server = http.createServer((req, res) => {
  *
  * @param {Error} err - The server error (its `code` property is inspected for EADDRINUSE/EACCES).
  * @returns {void} - No value is returned; the process terminates via `process.exit(1)`.
- * Source: server.js:L224-L240
+ * Source: server.js:L268-L284
  */
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
@@ -245,7 +289,7 @@ server.on('error', (err) => {
  * parameters.
  *
  * @returns {void} - No value is returned; it only writes the startup banner to stdout.
- * Source: server.js:L250-L253
+ * Source: server.js:L294-L297
  */
 server.listen(port, hostname, () => {
   console.log(`Server running at http://${hostname}:${port}/`);
@@ -259,7 +303,7 @@ server.listen(port, hostname, () => {
  * `gracefulShutdown('SIGTERM')`.
  *
  * @returns {void} - No value is returned; it delegates to `gracefulShutdown('SIGTERM')`.
- * Source: server.js:L264-L266
+ * Source: server.js:L308-L310
  */
 process.on('SIGTERM', () => {
   gracefulShutdown('SIGTERM');
@@ -271,7 +315,7 @@ process.on('SIGTERM', () => {
  * delegates to `gracefulShutdown('SIGINT')`.
  *
  * @returns {void} - No value is returned; it delegates to `gracefulShutdown('SIGINT')`.
- * Source: server.js:L276-L278
+ * Source: server.js:L320-L322
  */
 process.on('SIGINT', () => {
   gracefulShutdown('SIGINT');
@@ -285,7 +329,7 @@ process.on('SIGINT', () => {
  *
  * @param {Error} err - The uncaught exception.
  * @returns {void} - No value is returned; it triggers graceful shutdown or exits with code 1.
- * Source: server.js:L290-L300
+ * Source: server.js:L334-L344
  */
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err.message);
@@ -308,7 +352,7 @@ process.on('uncaughtException', (err) => {
  * @param {*} reason - The rejection reason (the value the promise was rejected with).
  * @param {Promise} promise - The promise that was rejected.
  * @returns {void} - No value is returned; it triggers graceful shutdown or exits with code 1.
- * Source: server.js:L313-L323
+ * Source: server.js:L357-L367
  */
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise);
