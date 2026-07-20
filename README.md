@@ -108,10 +108,12 @@ This server is a **catch-all**: it performs **no path-specific routing**. It doe
 | `OPTIONS` (any path) | `204 No Content` | `Allow: GET, HEAD, OPTIONS`, `Content-Length: 0` | *(none)* |
 | `POST` / `PUT` / `DELETE` / other | `405 Method Not Allowed` | `Allow: GET, HEAD, OPTIONS` | `Method Not Allowed\n` |
 | Invalid URL (> 2048 chars) | `400 Bad Request` | `Content-Type: text/plain` | `Bad Request - URL exceeds maximum length of 2048 characters\n` |
-| Invalid URL (contains a null byte) | `400 Bad Request` | `Content-Type: text/plain` | `Bad Request - URL contains invalid null bytes\n` |
+| Invalid URL (contains a raw null byte) — *see note below the table* | `400 Bad Request` | `Connection: close` | *(empty from a standard HTTP client)* |
 | Request received while shutting down | `503 Service Unavailable` | `Connection: close`, `Retry-After: 30` | `Service Unavailable - Server is shutting down\n` |
 
 `Source: server.js:L150-L212` (handler), `server.js:L166-L188` (503 / 400 / 405 paths).
+
+> **Note on the null-byte row.** A *raw* null byte in the request target is rejected by Node.js's built-in HTTP parser *before* the request ever reaches this application's handler, so a standard HTTP client observes only a bare `HTTP/1.1 400 Bad Request` with `Connection: close` and an **empty body** (no `Content-Type`). The application's own null-byte guard in `validateUrl` — which produces the body `Bad Request - URL contains invalid null bytes\n` with `Content-Type: text/plain` — is a **defensive validation layer** that a standard HTTP client cannot reach; it runs only when the exported request handler is invoked directly (for example, from a unit test). This parallels the layering caveat noted for the `503` response in the examples below. A *percent-encoded* `%00` is not a literal null byte, so it passes validation and receives the normal catch-all `200 OK` response. `Source: server.js:L101-L107` (validateUrl null-byte branch), `server.js:L174-L180` (handler 400 path).
 
 ### Examples
 
