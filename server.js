@@ -1,9 +1,11 @@
 /**
- * Robust HTTP Server Implementation
- * 
+ * @fileoverview A robust, dependency-free Node.js HTTP server that returns
+ * `Hello, World!` for GET requests, supports HEAD and OPTIONS, validates the
+ * request method and URL, and shuts down gracefully on process signals.
+ *
  * This server includes comprehensive error handling, graceful shutdown,
  * input validation, and proper resource cleanup.
- * 
+ *
  * Features:
  * - Server-level error handling (EADDRINUSE, EACCES)
  * - Request/response error handling
@@ -12,12 +14,16 @@
  * - Graceful shutdown with timeout
  * - Signal handling (SIGTERM, SIGINT)
  * - Process-level error handlers (uncaughtException, unhandledRejection)
+ *
+ * @module server
+ * @requires http
+ * Source: server.js:L1-L370
  */
 
 const http = require('http');
 
 // Server configuration - preserved from original
-const hostname = '127.0.0.1';
+const hostname = '127.0.0.1'; // Loopback bind address (not externally reachable by default)
 const port = 3000;
 
 // Shutdown configuration
@@ -34,11 +40,14 @@ let isShuttingDown = false;
 let shutdownTimer = null;
 
 /**
- * Graceful shutdown handler
- * Closes the server and waits for existing connections to complete
- * Forces exit after SHUTDOWN_TIMEOUT if connections don't close
- * 
- * @param {string} signal - The signal that triggered the shutdown (SIGTERM/SIGINT)
+ * Graceful shutdown handler. Idempotent: repeat invocations while a shutdown
+ * is already in progress are ignored (guarded by `isShuttingDown`). Stops
+ * accepting new connections, waits for existing connections to drain, and
+ * forces process exit after `SHUTDOWN_TIMEOUT` if they do not close in time.
+ *
+ * @param {string} signal - The signal that triggered the shutdown (e.g. 'SIGTERM', 'SIGINT').
+ * @returns {void} - No value is returned; the process exits asynchronously once connections drain or the timeout fires.
+ * Source: server.js:L52-L101
  */
 function gracefulShutdown(signal) {
   // Prevent multiple shutdown attempts
@@ -50,7 +59,15 @@ function gracefulShutdown(signal) {
   isShuttingDown = true;
   console.log(`${signal} received. Starting graceful shutdown...`);
 
-  // Set a timeout to force exit if graceful shutdown takes too long
+  /**
+   * Force-exit timer callback. Scheduled via `setTimeout` to fire after
+   * `SHUTDOWN_TIMEOUT` milliseconds; if the graceful shutdown has not
+   * completed by then, it logs the timeout to stderr and forces the
+   * process to exit. Takes no arguments.
+   *
+   * @returns {void} - No value is returned; it terminates the process via `process.exit(1)`.
+   * Source: server.js:L71-L74
+   */
   shutdownTimer = setTimeout(() => {
     console.error(`Shutdown timeout (${SHUTDOWN_TIMEOUT}ms) exceeded. Forcing exit.`);
     process.exit(1);
@@ -59,7 +76,17 @@ function gracefulShutdown(signal) {
   // Unref the timer so it doesn't keep the process alive
   shutdownTimer.unref();
 
-  // Stop accepting new connections and wait for existing ones to complete
+  /**
+   * `server.close()` completion callback. Invoked once the server has
+   * stopped accepting new connections and all in-flight connections have
+   * drained (or immediately with an error if the server was not listening).
+   * Clears the force-exit timer and exits the process: code 1 on error,
+   * code 0 on a clean close.
+   *
+   * @param {Error} [err] - Present only when closing the server failed (e.g. it was not running).
+   * @returns {void} - No value is returned; it terminates the process via `process.exit()`.
+   * Source: server.js:L90-L100
+   */
   server.close((err) => {
     if (err) {
       console.error('Error during server close:', err.message);
@@ -74,10 +101,11 @@ function gracefulShutdown(signal) {
 }
 
 /**
- * Validates the request URL
- * 
- * @param {string} url - The URL to validate
- * @returns {Object} - { valid: boolean, error?: string }
+ * Validates the request URL against length and content constraints.
+ *
+ * @param {string} url - The request URL to validate.
+ * @returns {{valid: boolean, error?: string}} - Validation result; `valid` is false with an `error` message when the URL exceeds MAX_URL_LENGTH characters or contains a null byte.
+ * Source: server.js:L110-L128
  */
 function validateUrl(url) {
   // Check URL length
@@ -100,18 +128,28 @@ function validateUrl(url) {
 }
 
 /**
- * Sends an error response with the specified status code and message
- * 
- * @param {http.ServerResponse} res - The response object
- * @param {number} statusCode - HTTP status code
- * @param {string} message - Error message to send
- * @param {Object} additionalHeaders - Optional additional headers
+ * Sends a plain-text error response with the specified status code and message.
+ *
+ * @param {http.ServerResponse} res - The HTTP response object.
+ * @param {number} statusCode - The HTTP status code to send.
+ * @param {string} message - The plain-text error message (a trailing newline is appended).
+ * @param {Object<string,string>} [additionalHeaders={}] - Optional extra response headers to set.
+ * @returns {void} - No value is returned; the response is written and ended as a side effect.
+ * Source: server.js:L140-L158
  */
 function sendErrorResponse(res, statusCode, message, additionalHeaders = {}) {
   res.statusCode = statusCode;
   res.setHeader('Content-Type', 'text/plain');
   
-  // Add any additional headers
+  /**
+   * Per-entry callback for the `Object.entries(additionalHeaders).forEach`
+   * iteration. Applies one caller-supplied header to the response.
+   *
+   * @param {string} key - The header name (first element of the destructured `[key, value]` entry).
+   * @param {string} value - The header value (second element of the destructured `[key, value]` entry).
+   * @returns {void} - No value is returned; it sets one response header via `res.setHeader`.
+   * Source: server.js:L153-L155
+   */
   Object.entries(additionalHeaders).forEach(([key, value]) => {
     res.setHeader(key, value);
   });
@@ -120,11 +158,32 @@ function sendErrorResponse(res, statusCode, message, additionalHeaders = {}) {
 }
 
 /**
- * HTTP Server Request Handler
- * Handles incoming HTTP requests with proper validation and error handling
+ * HTTP request handler for every incoming request. This is a catch-all
+ * handler with no path-based routing: the request path never selects a route,
+ * so all valid paths share the same per-method behavior. Every URL is still
+ * validated, and an overlong or null-byte URL yields 400 regardless of path.
+ *
+ * Decision order: attaches req/res error listeners -> responds 503 if the
+ * server is shutting down -> 400 on an invalid URL -> 405 if the method is not
+ * in ALLOWED_METHODS -> 204 for OPTIONS -> 200 headers-only for HEAD ->
+ * 200 with `Hello, World!\n` for GET.
+ *
+ * @param {http.IncomingMessage} req - The incoming HTTP request.
+ * @param {http.ServerResponse} res - The outgoing HTTP response.
+ * @returns {void} - No value is returned; the response is produced entirely via side effects on `res`.
+ * Source: server.js:L176-L256
  */
 const server = http.createServer((req, res) => {
-  // Handle request errors (e.g., client disconnection during upload)
+  /**
+   * Request-stream `'error'` event handler. Handles errors on the incoming
+   * request stream (for example, a client disconnecting mid-upload) by
+   * logging the error to stderr and, when no response has been sent yet,
+   * replying with a `400 Bad Request`.
+   *
+   * @param {Error} err - The error emitted on the request stream.
+   * @returns {void} - No value is returned; it logs and may send a 400 response as a side effect.
+   * Source: server.js:L187-L193
+   */
   req.on('error', (err) => {
     console.error('Request error:', err.message);
     // Only try to send error if headers haven't been sent
@@ -133,7 +192,16 @@ const server = http.createServer((req, res) => {
     }
   });
 
-  // Handle response errors (e.g., connection closed while sending)
+  /**
+   * Response-stream `'error'` event handler. Handles errors on the outgoing
+   * response stream (for example, the connection closing while the response
+   * is being written) by logging the error to stderr. It does not attempt to
+   * send a further response.
+   *
+   * @param {Error} err - The error emitted on the response stream.
+   * @returns {void} - No value is returned; it only logs the error to stderr.
+   * Source: server.js:L205-L207
+   */
   res.on('error', (err) => {
     console.error('Response error:', err.message);
   });
@@ -188,8 +256,14 @@ const server = http.createServer((req, res) => {
 });
 
 /**
- * Server-level error handler
- * Handles errors that occur when the server is starting or running
+ * Server-level error handler for errors raised while the server is starting or
+ * running. `EADDRINUSE` (the port is already in use) and `EACCES` (permission
+ * denied, e.g. binding a privileged port) are diagnosed specifically; all
+ * cases log a message and call `process.exit(1)`.
+ *
+ * @param {Error} err - The server error (its `code` property is inspected for EADDRINUSE/EACCES).
+ * @returns {void} - No value is returned; the process terminates via `process.exit(1)`.
+ * Source: server.js:L268-L284
  */
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
@@ -210,7 +284,12 @@ server.on('error', (err) => {
 });
 
 /**
- * Start the server
+ * Startup callback fired once the server is listening. Logs the startup banner
+ * `Server running at http://127.0.0.1:3000/` and the Ctrl+C hint. Takes no
+ * parameters.
+ *
+ * @returns {void} - No value is returned; it only writes the startup banner to stdout.
+ * Source: server.js:L294-L297
  */
 server.listen(port, hostname, () => {
   console.log(`Server running at http://${hostname}:${port}/`);
@@ -218,21 +297,39 @@ server.listen(port, hostname, () => {
 });
 
 /**
- * Signal Handlers for graceful shutdown
- * SIGTERM: Sent by process managers (Docker, Kubernetes, PM2) for graceful termination
- * SIGINT: Sent when user presses Ctrl+C
+ * SIGTERM signal handler for graceful shutdown. SIGTERM is the termination
+ * signal sent by process managers (Docker, Kubernetes, PM2) to request an
+ * orderly shutdown. The zero-argument callback delegates to
+ * `gracefulShutdown('SIGTERM')`.
+ *
+ * @returns {void} - No value is returned; it delegates to `gracefulShutdown('SIGTERM')`.
+ * Source: server.js:L308-L310
  */
 process.on('SIGTERM', () => {
   gracefulShutdown('SIGTERM');
 });
 
+/**
+ * SIGINT signal handler for graceful shutdown. SIGINT is delivered when the
+ * user presses Ctrl+C at the controlling terminal. The zero-argument callback
+ * delegates to `gracefulShutdown('SIGINT')`.
+ *
+ * @returns {void} - No value is returned; it delegates to `gracefulShutdown('SIGINT')`.
+ * Source: server.js:L320-L322
+ */
 process.on('SIGINT', () => {
   gracefulShutdown('SIGINT');
 });
 
 /**
- * Process-level error handlers
- * Catch-all for any unhandled errors to prevent silent crashes
+ * Process-level handler for uncaught synchronous exceptions. Acts as a
+ * catch-all to prevent silent crashes: it logs the error message and stack,
+ * then attempts a `gracefulShutdown('uncaughtException')` if a shutdown is not
+ * already in progress, otherwise it calls `process.exit(1)`.
+ *
+ * @param {Error} err - The uncaught exception.
+ * @returns {void} - No value is returned; it triggers graceful shutdown or exits with code 1.
+ * Source: server.js:L334-L344
  */
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err.message);
@@ -246,6 +343,17 @@ process.on('uncaughtException', (err) => {
   }
 });
 
+/**
+ * Process-level handler for unhandled promise rejections. Acts as a catch-all
+ * to prevent silent crashes: it logs the offending promise and rejection
+ * reason, then attempts a `gracefulShutdown('unhandledRejection')` if a
+ * shutdown is not already in progress, otherwise it calls `process.exit(1)`.
+ *
+ * @param {*} reason - The rejection reason (the value the promise was rejected with).
+ * @param {Promise} promise - The promise that was rejected.
+ * @returns {void} - No value is returned; it triggers graceful shutdown or exits with code 1.
+ * Source: server.js:L357-L367
+ */
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise);
   console.error('Reason:', reason);
